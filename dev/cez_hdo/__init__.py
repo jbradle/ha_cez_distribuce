@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
+import asyncio
+from datetime import datetime, time
 
 import voluptuous as vol
 
@@ -12,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.components.frontend import add_extra_js_url
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.event import async_track_time_change
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +30,32 @@ CONFIG_SCHEMA = vol.Schema({DOMAIN: cv.empty_config_schema}, extra=vol.ALLOW_EXT
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the ČEZ HDO component."""
     _LOGGER.info("Setting up ČEZ HDO integration")
+
+    # Deploy and register frontend card automatically
+    await _ensure_frontend_card(hass)
+
+    # Store scheduled update task reference
+    if DOMAIN not in hass.data:
+        hass.data[DOMAIN] = {}
+
+    # Schedule daily data refresh at 1:00 AM
+    async def daily_data_refresh(now):
+        """Refresh all ČEZ HDO data at 1:00 AM."""
+        _LOGGER.info("🕐 Spouštím denní aktualizaci ČEZ HDO dat v 1:00")
+        
+        # Force update all registered entities by clearing their cache
+        for entity in hass.data[DOMAIN].get("entities", []):
+            if hasattr(entity, "_last_update_time"):
+                entity._last_update_time = None
+            if hasattr(entity, "async_schedule_update_ha_state"):
+                entity.async_schedule_update_ha_state(True)
+        
+        _LOGGER.info("✅ Denní aktualizace ČEZ HDO dokončena")
+
+    # Register daily refresh at 1:00 AM
+    hass.data[DOMAIN]["daily_refresh_unsub"] = async_track_time_change(
+        hass, daily_data_refresh, hour=1, minute=0, second=0
+    )
 
     # Deploy and register frontend card automatically
     await _ensure_frontend_card(hass)
@@ -118,6 +147,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # Cancel daily refresh if it exists
+    if DOMAIN in hass.data and "daily_refresh_unsub" in hass.data[DOMAIN]:
+        hass.data[DOMAIN]["daily_refresh_unsub"]()
+        _LOGGER.info("Daily refresh scheduler cancelled")
+    
     return True
 
 

@@ -3,17 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import timedelta
+from datetime import timedelta, datetime, time as dt_time
 from pathlib import Path
 from typing import Any
 
 import requests
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle
+from homeassistant.helpers.event import async_track_time_interval
 
 from . import downloader
 
-MIN_TIME_BETWEEN_SCANS = timedelta(seconds=3600)
+MIN_TIME_BETWEEN_SCANS = timedelta(seconds=86400)  # 24 hodin
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "cez_hdo"
@@ -29,7 +30,30 @@ class CezHdoBaseEntity(Entity):
         self._name = name
         self._response_data: dict[str, Any] | None = None
         self._last_update_success = False
+        self._last_update_time = None
         self.update()
+
+    async def async_added_to_hass(self) -> None:
+        """When entity is added to hass, register for daily updates."""
+        await super().async_added_to_hass()
+        
+        # Register this entity for daily refresh
+        if DOMAIN not in self.hass.data:
+            self.hass.data[DOMAIN] = {}
+        if "entities" not in self.hass.data[DOMAIN]:
+            self.hass.data[DOMAIN]["entities"] = []
+        
+        if self not in self.hass.data[DOMAIN]["entities"]:
+            self.hass.data[DOMAIN]["entities"].append(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """When entity is removed, unregister from daily updates."""
+        if (DOMAIN in self.hass.data 
+            and "entities" in self.hass.data[DOMAIN]
+            and self in self.hass.data[DOMAIN]["entities"]):
+            self.hass.data[DOMAIN]["entities"].remove(self)
+        
+        await super().async_will_remove_from_hass()
 
     @property
     def name(self) -> str:
@@ -235,3 +259,118 @@ class CezHdoBaseEntity(Entity):
         except (KeyError, TypeError) as err:
             _LOGGER.error("Error processing HDO data: %s", err)
             return False, None, None, None, False, None, None, None
+
+    def get_low_tariff_remaining_seconds(self) -> int | None:
+        """Get remaining seconds of current low tariff period."""
+        hdo_data = self._get_hdo_data()
+        low_tariff_active = hdo_data[0]
+        low_tariff_end = hdo_data[2]
+
+        if not low_tariff_active or low_tariff_end is None:
+            return None
+
+        now = datetime.now(tz=downloader.CEZ_TIMEZONE)
+        end_today = datetime.combine(now.date(), low_tariff_end, tzinfo=downloader.CEZ_TIMEZONE)
+
+        # Pokud je konec před současným časem, jedná se o konec zítra
+        if end_today <= now:
+            end_today = end_today.replace(day=end_today.day + 1)
+
+        remaining = (end_today - now).total_seconds()
+        return max(0, int(remaining))
+
+    def get_high_tariff_remaining_seconds(self) -> int | None:
+        """Get remaining seconds of current high tariff period."""
+        hdo_data = self._get_hdo_data()
+        high_tariff_active = hdo_data[4]
+        high_tariff_end = hdo_data[6]
+
+        if not high_tariff_active or high_tariff_end is None:
+            return None
+
+        now = datetime.now(tz=downloader.CEZ_TIMEZONE)
+        end_today = datetime.combine(now.date(), high_tariff_end, tzinfo=downloader.CEZ_TIMEZONE)
+
+        # Pokud je konec před současným časem, jedná se o konec zítra
+        if end_today <= now:
+            end_today = end_today.replace(day=end_today.day + 1)
+
+        remaining = (end_today - now).total_seconds()
+        return max(0, int(remaining))
+
+    def get_next_low_tariff_seconds(self) -> int | None:
+        """Get seconds until next low tariff period starts."""
+        hdo_data = self._get_hdo_data()
+        low_tariff_active = hdo_data[0]
+        low_start = hdo_data[1]
+
+        if low_tariff_active or low_start is None:
+            return None
+
+        now = datetime.now(tz=downloader.CEZ_TIMEZONE)
+        start_today = datetime.combine(now.date(), low_start, tzinfo=downloader.CEZ_TIMEZONE)
+
+        # Pokud je start před současným časem, jedná se o start zítra
+        if start_today <= now:
+            start_today = start_today.replace(day=start_today.day + 1)
+
+        remaining = (start_today - now).total_seconds()
+        return max(0, int(remaining))
+
+    def get_next_high_tariff_seconds(self) -> int | None:
+        """Get seconds until next high tariff period starts."""
+        hdo_data = self._get_hdo_data()
+        high_tariff_active = hdo_data[4]
+        high_start = hdo_data[5]
+
+        if high_tariff_active or high_start is None:
+            return None
+
+        now = datetime.now(tz=downloader.CEZ_TIMEZONE)
+        start_today = datetime.combine(now.date(), high_start, tzinfo=downloader.CEZ_TIMEZONE)
+
+        # Pokud je start před současným časem, jedná se o start zítra
+        if start_today <= now:
+            start_today = start_today.replace(day=start_today.day + 1)
+
+        remaining = (start_today - now).total_seconds()
+        return max(0, int(remaining))
+
+
+class CezHdoFrequentUpdateEntity(CezHdoBaseEntity):
+    """Entity that updates every second for time remaining displays."""
+
+    def __init__(self, ean: str, name: str, signal: str | None = None) -> None:
+        """Initialize the frequently updating entity."""
+        super().__init__(ean, name, signal)
+        self._update_interval_unsub = None
+
+    async def async_added_to_hass(self) -> None:
+        """When entity is added to hass, start the update timer."""
+        await super().async_added_to_hass()
+        
+        # Update every second for time remaining calculations
+        self._update_interval_unsub = async_track_time_interval(
+            self.hass, self._async_update_state, timedelta(seconds=1)
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """When entity is removed, stop the update timer."""
+        if self._update_interval_unsub:
+            self._update_interval_unsub()
+        await super().async_will_remove_from_hass()
+
+    async def _async_update_state(self, now=None) -> None:
+        """Update the entity state without fetching new data."""
+        self.async_schedule_update_ha_state()
+
+    @property
+    def should_poll(self) -> bool:
+        """These entities don't need traditional polling."""
+        return False
+
+    def update(self) -> None:
+        """Override update to prevent throttling on frequent entities."""
+        # Don't call the parent update() method as it's throttled
+        # We rely on the existing data from the daily updates
+        pass
